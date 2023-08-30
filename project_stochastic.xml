@@ -1,0 +1,1140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nta PUBLIC '-//Uppaal Team//DTD Flat System 1.6//EN' 'http://www.it.uu.se/research/group/darts/uppaal/flat-1_6.dtd'>
+<nta>
+	<declaration>const int                    nSlots                                    =            105;                            // Number of slots
+const int                    nPS                                       =            6;                              // Number of processing stations
+const int                    nObj                                      =            3;                              // Number of object
+
+const int TAU = 10000;
+
+/*** TYPES ************************************************************/
+
+typedef int[0, nSlots - 1]   id_slot;
+typedef int[0, nPS - 1]      id_ps;
+typedef int[0, nObj - 1]     id_obj;
+typedef int[-1, 1]           sensorValue;  // -1 false positive, 0 negative, 1 positive
+
+
+/*** PARAMETERS *******************************************************/
+
+const int                    inverseSpeed                              =            10;                            // conveyor belt speed in [time units / slot]
+
+// Processing station position
+const id_slot                SLOTS_BEFORE_PS[nPS]                      =            {15, 35, 63, 71, 92, 103};     // id of slot before each processing station
+const id_slot                SLOTS_AFTER_PS[nPS]                       =            {16, 36, 64, 72, 93, 104};     // id of slot after each processing station
+
+// Processing time parameters of processing stations
+const int                    PS_TIME_MEAN[nPS]                         =            {100, 200, 300, 400, 500, 600};
+const int                    PS_TIME_STD[nPS]                          =            {10, 20, 30, 40, 50, 60};
+
+// Parameters of sensors guarding the queues of the processing stations
+const int                    nSensorQueue                              =            5;                              // number of sensors
+const id_slot                SENSOR_QUEUE_INDEXES[nSensorQueue]        =            {1, 22, 65, 80, 99};            // indexes of slots with a sensor (right queues)
+const int                    SENSOR_QUEUE_FN_WEIGHT[nSensorQueue]      =            {10, 10, 10, 10, 10};                // probability of sensor false negative [‰]
+const int                    SENSOR_QUEUE_FP_WEIGHT[nSensorQueue]      =            {10, 10, 10, 10, 10};                // probability of sensor false positive [‰]
+const int                    PS_SENSOR_QUEUE_TO_LISTEN[nPS]            =            {1, 3, 2, 4, 4, 0};             // sensor listened by each processing station
+
+// Parameters of sensors guarding the entrances of the processing stations
+const int                    nSensorPS                                 =            nPS;                            // number of sensors
+const id_slot                SENSOR_PS_INDEXES[nSensorPS]              =            {13, 33, 62, 69, 90, 102};      // indexes of slot with a sensor
+const int                    SENSOR_PS_FN_WEIGHT[nSensorPS]            =            {10, 10, 10, 10, 10, 10};             // probability of sensor false negative  [‰]
+const int                    SENSOR_PS_FP_WEIGHT[nSensorPS]            =            {10, 10, 10, 10, 10, 10};             // probability of sensor false positive  [‰]
+const id_ps                  SENSOR_PS_LISTENED_PS[nSensorPS]          =            {0, 1, 2, 3, 4, 5};             // processing station listened by each sensor
+
+
+/*** CHANNELS *********************************************************/
+
+urgent broadcast chan freePS[nPS],                // synchronize a processing station and the object exiting it
+                      busyPS[nPS],                // synchronize an object entering a processing station and the processing station
+                      finishProcessing[nPS],      // synchronize a processing station and the processed object object when the processing is finished
+                      freeSlot[nSlots],           // synchronize an object exiting a slot and the slot
+                      busySlot[nSlots];           // synchronize an object entering a slot and the slot
+broadcast chan        shift;                      // synchronize the conveyor belt movement with all the others movements (i.e. changing slot, enter and exit a processing station)
+
+
+/*** BOOLEAN VALUE TO SYNCHRONIZE OVER BROADCAST CHANNELS *************/
+
+bool sync_freePS[nPS],                // used by the states having an exit edge with freePS[]? to tell the states with freePS[]! that they are ready to syncronize over the channel
+     sync_busyPS[nPS],                // used by the states having an exit edge with busyPS[]? to tell the states with busyPS[]! that they are ready to syncronize over the channel
+     sync_finishProcessing[nPS],      // used by the states having an exit edge with finishProcessing[]? to tell the states with finishProcessing[]! that they are ready to syncronize over the channel
+     sync_freeSlot[nSlots],           // used by the states having an exit edge with freeSlot[]? to tell the states with freeSlot[]! that they are ready to syncronize over the channel
+     sync_busySlot[nSlots];           // used by the states having an exit edge with busySlot[]? to tell the states with busySlot[]! that they are ready to syncronize over the channel
+
+
+/*** GLOABAL VARIABLES AND FUNCTIONS **********************************/
+
+sensorValue sensorPS[nPS];              // sensors guarding the entrances of the processing stations
+sensorValue sensorQueue[nSlots];        // sensors guarding the queues of the processing stations (we create a sensor for each slot because we use it for some verification tests)
+
+/*
+    Return true if after the taken slot the is a slot, flase otherwise (i.e. there is a processing station)
+*/
+bool isNextSlot(id_slot slot) {
+    return !exists(i : id_ps) SLOTS_BEFORE_PS[i] == slot;
+}
+
+/*
+    Choose a direction at the crossroad
+*/
+bool branchSwitch = false;  //  randomly switched by the conveyor belt
+int controller() {
+    if(branchSwitch) {
+        return 62;
+    }
+    return 77;
+}
+
+/*
+    Return the next slot of a slot
+    (If after slot there is a processing station the returned value is meaningless, check using isNextSlot)
+
+    (Modify this function to change the conveyor belt shape)
+*/
+id_slot nextSlot(id_slot slot) {
+    if(exists(i : id_ps) SLOTS_BEFORE_PS[i] == slot) // processing station
+        return 0;  // meaningless value (should not be executed)
+    if(slot == 104)  // end
+        return 0;
+    if(slot == 61)  // crossroads
+        return controller();
+    if(slot == 76)  // join
+        return 97;
+    return slot + 1;
+}
+
+/*
+    Return the next slot of a processing station
+*/
+id_slot nextSlotPS(id_ps ps) {
+    return SLOTS_AFTER_PS[ps];
+}
+
+/*
+    Return the next processing station of a slot
+    (If after slot there is another slot the returned value is meaningless, check using isNextSlot)
+*/
+id_ps nextPS(id_slot slot) {
+    int i = 0;
+    for(i = 0; i &lt; nPS; i++)
+        if(SLOTS_BEFORE_PS[i] == slot)
+            return i;
+    return 0;  // meaningless value (should not be executed)
+}
+</declaration>
+	<template>
+		<name>ConveyorBelt</name>
+		<declaration>clock t = 0;  // clock that controls the conveyor belt movement
+
+/*
+    Function that models the sensors' false positive
+*/
+void faultSensors() {
+    double pr;
+    int sps = 0;
+    int sq = 0;
+
+    for(sps = 0; sps &lt; nSensorPS; sps++) {
+        pr = random(1000);
+        if(pr &lt;= SENSOR_PS_FP_WEIGHT[sps] &amp;&amp; sensorPS[sps] == 0)
+            sensorPS[sps] = -1;
+    }
+
+    for(sq = 0; sq &lt; nSensorQueue; sq++) {
+        pr = random(1000);
+        if(pr &lt;= SENSOR_QUEUE_FP_WEIGHT[sq] &amp;&amp; sensorQueue[SENSOR_QUEUE_INDEXES[sq]] == 0)
+            sensorQueue[SENSOR_QUEUE_INDEXES[sq]] = -1;
+        else if(sensorQueue[SENSOR_QUEUE_INDEXES[sq]] == -1)
+            sensorQueue[SENSOR_QUEUE_INDEXES[sq]] = 0;
+    }
+}
+
+/*
+    Randomly cahnge the direction to take ad the crossroad
+*/
+void setBranchSwitch() {
+    if(0.5 &lt; random(1))
+        branchSwitch = !branchSwitch;
+}
+
+/*
+    Set to true the boolean values used to synchronize over the broadcast channels busyPS and busySlot to express the fact that the slots and the processing stations are all ready to be occupied
+*/
+void initialize() {
+    int id = 0;
+    for(id = 0; id &lt; nPS; id++)
+        sync_busyPS[id] = true;
+    for(id = 0; id &lt; nSlots; id++)
+        sync_busySlot[id] = true;
+}
+</declaration>
+		<location id="id0" x="8" y="4">
+			<label kind="invariant" x="-10" y="17">t &lt;= inverseSpeed</label>
+		</location>
+		<location id="id1" x="289" y="-170">
+			<committed/>
+		</location>
+		<init ref="id1"/>
+		<transition id="id2">
+			<source ref="id1"/>
+			<target ref="id0"/>
+			<label kind="assignment" x="144" y="-76">initialize()</label>
+		</transition>
+		<transition id="id3">
+			<source ref="id0"/>
+			<target ref="id0"/>
+			<label kind="guard" x="-255" y="-42">t &gt;= inverseSpeed</label>
+			<label kind="synchronisation" x="-255" y="-25">shift!</label>
+			<label kind="assignment" x="-255" y="-8">t = 0,
+faultSensors(),
+setBranchSwitch()</label>
+			<nail x="-110" y="76"/>
+			<nail x="-110" y="-76"/>
+		</transition>
+	</template>
+	<template>
+		<name>Object</name>
+		<parameter>const id_obj id</parameter>
+		<declaration>bool inSlot = false;  // true if the object is in a slot
+id_slot slot = 0;  // id of the current slot
+id_slot next = 0;  // id of the next slot
+
+bool inPS = false;  // true if the object is in a processing station
+id_ps ps = 0;  // if of the current processing station
+
+/*
+    return true if this slot has a sensor guarding the entrance of a processing station
+*/
+bool hasNextSlotSensorPS(id_slot id){
+    return exists(i : int[0, nSensorPS - 1]) SENSOR_PS_INDEXES[i] == nextSlot(id);
+}
+
+/*
+    Return the processing station's id this slot needs to guard the entrance
+
+    (If this slot has not a sensor guarding the entrance of a processing station the returned value is meaningless, check using needsToListen)
+*/
+id_ps nextSlotListenPS(id_slot id){
+    int i = 0;    
+    id = nextSlot(id);
+    for(i = 0; i &lt; nSensorPS; i++)
+        if(SENSOR_PS_INDEXES[i] == id)
+            return SENSOR_PS_LISTENED_PS[i];
+    return 0; // meaningless value because slot do not have this type of sensor
+}
+</declaration>
+		<location id="id4" x="-3068" y="-2813">
+			<name x="-3128" y="-2805">slotted</name>
+		</location>
+		<location id="id5" x="-2720" y="-2813">
+			<committed/>
+		</location>
+		<location id="id6" x="-3629" y="-2813">
+			<name x="-3646" y="-2847">start</name>
+		</location>
+		<location id="id7" x="-3204" y="-3060">
+			<committed/>
+		</location>
+		<location id="id8" x="-2924" y="-3060">
+			<name x="-2934" y="-3094">readyChangingSlot</name>
+		</location>
+		<location id="id9" x="-2448" y="-2813">
+			<name x="-2482" y="-2847">readyEnterPS</name>
+		</location>
+		<location id="id10" x="-2014" y="-2813">
+			<name x="-2024" y="-2847">inProcessing</name>
+		</location>
+		<location id="id11" x="-2448" y="-2592">
+			<urgent/>
+		</location>
+		<location id="id12" x="-2720" y="-2592">
+			<name x="-2771" y="-2575">readyEnterSlot</name>
+		</location>
+		<location id="id13" x="-3391" y="-2813">
+			<name x="-3434" y="-2847">readyEnterSystem</name>
+		</location>
+		<location id="id14" x="-2014" y="-2592">
+			<name x="-2014" y="-2575">endedProcessing</name>
+		</location>
+		<init ref="id6"/>
+		<transition id="id15">
+			<source ref="id10"/>
+			<target ref="id14"/>
+			<label kind="synchronisation" x="-2005" y="-2720">finishProcessing[ps]?</label>
+			<label kind="assignment" x="-2006" y="-2703">sync_finishProcessing[ps] = false</label>
+		</transition>
+		<transition id="id16">
+			<source ref="id14"/>
+			<target ref="id11"/>
+			<label kind="guard" x="-2388" y="-2635">sync_busySlot[nextSlotPS(ps)]</label>
+			<label kind="synchronisation" x="-2371" y="-2618">busySlot[nextSlotPS(ps)]!</label>
+			<label kind="assignment" x="-2363" y="-2592">next = nextSlotPS(ps),
+sync_freePS[ps] = true</label>
+		</transition>
+		<transition id="id17">
+			<source ref="id13"/>
+			<target ref="id4"/>
+			<label kind="synchronisation" x="-3264" y="-2839">shift?</label>
+			<label kind="assignment" x="-3264" y="-2813">slot = 0,
+inSlot = true</label>
+		</transition>
+		<transition id="id18">
+			<source ref="id6"/>
+			<target ref="id13"/>
+			<label kind="guard" x="-3570" y="-2856">sync_busySlot[0]</label>
+			<label kind="synchronisation" x="-3553" y="-2839">busySlot[0]!</label>
+		</transition>
+		<transition id="id19">
+			<source ref="id12"/>
+			<target ref="id4"/>
+			<label kind="synchronisation" x="-2949" y="-2618">shift?</label>
+			<label kind="assignment" x="-3000" y="-2592">slot = next,
+inPS = false,
+inSlot= true</label>
+			<nail x="-3069" y="-2592"/>
+		</transition>
+		<transition id="id20">
+			<source ref="id11"/>
+			<target ref="id12"/>
+			<label kind="synchronisation" x="-2626" y="-2618">freePS[ps]?</label>
+			<label kind="assignment" x="-2677" y="-2592">sync_freePS[ps] = false</label>
+		</transition>
+		<transition id="id21">
+			<source ref="id9"/>
+			<target ref="id10"/>
+			<label kind="synchronisation" x="-2346" y="-2839">shift?</label>
+			<label kind="assignment" x="-2388" y="-2813">ps = nextPS(slot),
+inPS = true,
+inSlot = false,
+sync_finishProcessing[nextPS(slot)] = true</label>
+		</transition>
+		<transition id="id22">
+			<source ref="id5"/>
+			<target ref="id9"/>
+			<label kind="synchronisation" x="-2652" y="-2839">freeSlot[slot]!</label>
+		</transition>
+		<transition id="id23">
+			<source ref="id8"/>
+			<target ref="id4"/>
+			<label kind="synchronisation" x="-2983" y="-2949">shift?</label>
+			<label kind="assignment" x="-2992" y="-2932">slot = next</label>
+		</transition>
+		<transition id="id24">
+			<source ref="id7"/>
+			<target ref="id8"/>
+			<label kind="synchronisation" x="-3119" y="-3085">freeSlot[slot]!</label>
+		</transition>
+		<transition id="id25">
+			<source ref="id4"/>
+			<target ref="id7"/>
+			<label kind="guard" x="-3451" y="-3026">sync_freeSlot[slot] &amp;&amp;
+sync_busySlot[nextSlot(slot)] &amp;&amp;
+isNextSlot(slot) &amp;&amp;
+(hasNextSlotSensorPS(slot) imply
+sensorPS[nextSlotListenPS(slot)] == 0)</label>
+			<label kind="synchronisation" x="-3323" y="-2915">busySlot[nextSlot(slot)]!</label>
+			<label kind="assignment" x="-3289" y="-2898">next = nextSlot(slot)</label>
+		</transition>
+		<transition id="id26">
+			<source ref="id4"/>
+			<target ref="id5"/>
+			<label kind="guard" x="-2958" y="-2873">sync_busyPS[nextPS(slot)] &amp;&amp;
+sync_freeSlot[slot] &amp;&amp;
+!isNextSlot(slot)</label>
+			<label kind="synchronisation" x="-2958" y="-2813">busyPS[nextPS(slot)]!</label>
+		</transition>
+	</template>
+	<template>
+		<name>Slot</name>
+		<parameter>const id_slot id</parameter>
+		<declaration>/*
+    return true if this slot has a sensor guarding the entrance of a processing station
+*/
+bool needsToListen(){
+    return exists(i : int[0, nSensorPS - 1]) SENSOR_PS_INDEXES[i] == id;
+}
+
+/*
+    Return the processing station's id this slot needs to guard the entrance
+
+    (If this slot has not a sensor guarding the entrance of a processing station the returned value is meaningless, check using needsToListen)
+*/
+id_ps psToListen(){
+    int i = 0;
+    for(i = 0; i &lt; nSensorPS; i++)
+        if(SENSOR_PS_INDEXES[i] == id)
+            return SENSOR_PS_LISTENED_PS[i];
+    return 0; // meaningless value because slot do not have this type of sensor
+}
+
+/*
+    Return the false negative probability of the sensor guarding the entrance of a processing station located in this slot
+
+    (If this slot has not a sensor guarding the entrance of a processing station the returned value is meaningless, check using needsToListen)
+*/
+int sensorPSWeight(){
+    int i = 0;
+    for(i = 0; i &lt; nSensorPS; i++)
+        if(SENSOR_PS_INDEXES[i] == id)
+            return SENSOR_PS_FN_WEIGHT[i];
+    return -1; // meaningless value because slot do not have this type of sensor
+}
+
+/*
+    Return the false negative probability of the sensor guarding the queue lenght of a processing station
+
+    (If there is no sensor on this slot the returned value is zero because we use it for some verification test)
+*/
+int sensorQueueWeight() {
+    int i = 0;
+    for(i = 0; i &lt; nSensorQueue; i++)
+        if(SENSOR_QUEUE_INDEXES[i] == id)
+            return SENSOR_QUEUE_FN_WEIGHT[i];
+    return 0; // there is no sensor on this slot, we put the probability of fail at zero in this case because we use it for some verification test
+}
+
+
+int weight_FN_sensorQueue = sensorQueueWeight();  // false negative probability of the sensor guarding the queue lenght of a processing station
+
+bool hasSensorPS = needsToListen();  // true if this slot has a sensor guarding the entrance of a processing station
+id_ps psListened = psToListen();  // processing station's id this slot needs to guard the entrance (if hasSensorPS is false, this value is meaningless)
+int weight_FN_sensorPS = sensorPSWeight(); // false negative probability of the sensor guarding the entrance of a processing station located in this slot (if hasSensorPS is false, this value is meaningless)
+</declaration>
+		<location id="id27" x="-1020" y="-136">
+			<name x="-1003" y="-178">free</name>
+		</location>
+		<location id="id28" x="-85" y="-136">
+			<name x="-60" y="-144">occupied</name>
+		</location>
+		<location id="id29" x="-646" y="-459">
+			<name x="-714" y="-493">readyToBeOccupied</name>
+		</location>
+		<location id="id30" x="-646" y="161">
+			<name x="-637" y="93">readyToBeFree</name>
+		</location>
+		<location id="id31" x="382" y="-127">
+			<committed/>
+		</location>
+		<location id="id32" x="-484" y="-357">
+			<committed/>
+		</location>
+		<branchpoint id="id33" x="-442" y="-331"/>
+		<branchpoint id="id34" x="153" y="-306"/>
+		<init ref="id27"/>
+		<transition id="id35">
+			<source ref="id32"/>
+			<target ref="id33"/>
+		</transition>
+		<transition id="id36">
+			<source ref="id29"/>
+			<target ref="id32"/>
+			<label kind="guard" x="-569" y="-433">hasSensorPS</label>
+			<label kind="synchronisation" x="-544" y="-416">shift?</label>
+			<label kind="assignment" x="-518" y="-399">sync_freeSlot[id] = true</label>
+		</transition>
+		<transition id="id37">
+			<source ref="id33"/>
+			<target ref="id28"/>
+			<label kind="comments" x="-382" y="-195">fault sensor</label>
+			<label kind="probability" x="-374" y="-170">weight_FN_sensorPS</label>
+			<nail x="-348" y="-68"/>
+		</transition>
+		<transition id="id38">
+			<source ref="id33"/>
+			<target ref="id28"/>
+			<label kind="assignment" x="-408" y="-340">sensorPS[psListened] = 1</label>
+			<label kind="probability" x="-357" y="-314">1000 - weight_FN_sensorPS</label>
+		</transition>
+		<transition id="id39">
+			<source ref="id34"/>
+			<target ref="id28"/>
+			<label kind="comments" x="-17" y="-297">fault sensor</label>
+			<label kind="probability" x="-42" y="-331">weight_FN_sensorQueue</label>
+			<nail x="-25" y="-306"/>
+		</transition>
+		<transition id="id40">
+			<source ref="id34"/>
+			<target ref="id28"/>
+			<label kind="assignment" x="17" y="-212">sensorQueue[id] = 1</label>
+			<label kind="probability" x="-17" y="-187">1000 - weight_FN_sensorQueue</label>
+		</transition>
+		<transition id="id41">
+			<source ref="id31"/>
+			<target ref="id34"/>
+		</transition>
+		<transition id="id42">
+			<source ref="id28"/>
+			<target ref="id31"/>
+			<label kind="synchronisation" x="153" y="25">shift?</label>
+			<nail x="144" y="34"/>
+		</transition>
+		<transition id="id43">
+			<source ref="id30"/>
+			<target ref="id29"/>
+			<label kind="synchronisation" x="-782" y="-127">busySlot[id]?</label>
+			<label kind="assignment" x="-858" y="-110">sync_busySlot[id] = false</label>
+		</transition>
+		<transition id="id44">
+			<source ref="id30"/>
+			<target ref="id27"/>
+			<label kind="synchronisation" x="-1080" y="85">shift?</label>
+			<nail x="-1020" y="161"/>
+		</transition>
+		<transition id="id45">
+			<source ref="id28"/>
+			<target ref="id30"/>
+			<label kind="synchronisation" x="-298" y="68">freeSlot[id]?</label>
+			<label kind="assignment" x="-297" y="85">sensorQueue[id] = 0,
+sync_busySlot[id] = true,
+sync_freeSlot[id] = false</label>
+			<nail x="-85" y="161"/>
+		</transition>
+		<transition id="id46">
+			<source ref="id29"/>
+			<target ref="id28"/>
+			<label kind="guard" x="-374" y="-518">!hasSensorPS</label>
+			<label kind="synchronisation" x="-374" y="-501">shift?</label>
+			<label kind="assignment" x="-374" y="-484">sync_freeSlot[id] = true</label>
+			<nail x="-85" y="-459"/>
+		</transition>
+		<transition id="id47">
+			<source ref="id27"/>
+			<target ref="id29"/>
+			<label kind="synchronisation" x="-1224" y="-322">busySlot[id]?</label>
+			<label kind="assignment" x="-1224" y="-306">sync_busySlot[id] = false</label>
+			<nail x="-1020" y="-459"/>
+		</transition>
+	</template>
+	<template>
+		<name x="5" y="5">ProcessingStation</name>
+		<parameter>const id_ps id</parameter>
+		<declaration>clock t;  // clock used to count the passed processing time
+int processingTime = 0;  // used to contain the needed time to process an object
+
+id_slot sensorQueue_id = SENSOR_QUEUE_INDEXES[PS_SENSOR_QUEUE_TO_LISTEN[id]];  // sensor queue this processing station needs to listen
+
+/*
+    Return true when the sensor queue it needs to listen is telling the the queue is full (or the sensor is in false positive)
+*/
+bool isNextQueueFull() {
+    if(sensorQueue[sensorQueue_id] == 1 || sensorQueue[sensorQueue_id] == -1)  // if sensor positive or false positive
+        return true;
+    else
+        return false;
+}
+</declaration>
+		<location id="id48" x="399" y="-68">
+			<name x="389" y="-102">free</name>
+		</location>
+		<location id="id49" x="399" y="255">
+			<name x="382" y="272">processingOrWaitingForSensor</name>
+			<label kind="invariant" x="416" y="297">t &lt;= processingTime</label>
+		</location>
+		<location id="id50" x="-204" y="255">
+			<name x="-348" y="246">endedProcessing</name>
+		</location>
+		<location id="id51" x="-204" y="-68">
+			<name x="-272" y="-110">readyToBeFree</name>
+		</location>
+		<location id="id52" x="637" y="85">
+			<name x="627" y="51">readyToStartProcessing</name>
+		</location>
+		<location id="id53" x="93" y="255">
+		</location>
+		<init ref="id48"/>
+		<transition id="id54">
+			<source ref="id51"/>
+			<target ref="id52"/>
+			<label kind="synchronisation" x="110" y="8">busyPS[id]?</label>
+			<label kind="assignment" x="110" y="25">sync_busyPS[id] = false</label>
+		</transition>
+		<transition id="id55">
+			<source ref="id49"/>
+			<target ref="id53"/>
+			<label kind="guard" x="204" y="229">t &gt;= processingTime</label>
+		</transition>
+		<transition id="id56">
+			<source ref="id53"/>
+			<target ref="id50"/>
+			<label kind="guard" x="-136" y="187">sync_finishProcessing[id] &amp;&amp;
+!isNextQueueFull()</label>
+			<label kind="synchronisation" x="-136" y="229">finishProcessing[id]!</label>
+		</transition>
+		<transition id="id57">
+			<source ref="id52"/>
+			<target ref="id49"/>
+			<label kind="synchronisation" x="510" y="178">shift?</label>
+			<label kind="assignment" x="510" y="195">t = 0</label>
+		</transition>
+		<transition id="id58">
+			<source ref="id48"/>
+			<target ref="id52"/>
+			<label kind="synchronisation" x="501" y="-34">busyPS[id]?</label>
+			<label kind="assignment" x="544" y="-17">processingTime = fint(random_normal(PS_TIME_MEAN[id], PS_TIME_STD[id])),
+sync_busyPS[id] = false</label>
+		</transition>
+		<transition id="id59">
+			<source ref="id51"/>
+			<target ref="id48"/>
+			<label kind="synchronisation" x="76" y="-93">shift?</label>
+		</transition>
+		<transition id="id60">
+			<source ref="id50"/>
+			<target ref="id51"/>
+			<label kind="guard" x="-382" y="51">sync_freePS[id]</label>
+			<label kind="synchronisation" x="-382" y="68">freePS[id]!</label>
+			<label kind="assignment" x="-382" y="85">sensorPS[id] = 0,
+sync_busyPS[id] = true</label>
+		</transition>
+	</template>
+	<system>// Place template instantiations here.
+conveyorBelt = ConveyorBelt();
+
+// List one or more processes to be composed into a system.
+system Slot, ProcessingStation, Object, conveyorBelt;
+</system>
+	<queries>
+		<option key="--diagnostic" value="1"/>
+		<query>
+			<formula>Pr[&lt;=TAU] ([] forall (id_0:id_obj) forall (id_1:id_obj) (id_0 != id_1 &amp;&amp; Object(id_0).inPS &amp;&amp; Object(id_1).inPS) imply Object(id_0).ps != Object(id_1).ps)</formula>
+			<comment>1. Probability that never happens that a station holds more than 1 piece</comment>
+			<result outcome="success" type="interval" value="≥ 0.950056 (95% CI)" timestamp="2023-07-20 18:55:43 +0200">
+				<option key="--diagnostic" value="1"/>
+				<details>≥ 0.950056 (95% CI)</details>
+			</result>
+		</query>
+		<query>
+			<formula>Pr[&lt;=TAU] ([] forall (id_0:id_obj) forall (id_1:id_obj) (id_0 != id_1 &amp;&amp; Object(id_0).inSlot &amp;&amp; Object(id_1).inSlot) imply Object(id_0).slot!=Object(id_1).slot)</formula>
+			<comment>2. Probability that never happens that two pieces occupy the same belt slot</comment>
+			<result outcome="success" type="interval" value="≥ 0.950056 (95% CI)" timestamp="2023-07-20 18:55:46 +0200">
+				<option key="--diagnostic" value="1"/>
+				<details>≥ 0.950056 (95% CI)</details>
+			</result>
+		</query>
+		<query>
+			<formula>Pr[&lt;=TAU] ([] !sensorQueue[SENSOR_QUEUE_INDEXES[0]-1] &amp;&amp;!sensorQueue[SENSOR_QUEUE_INDEXES[1]-1] &amp;&amp; !sensorQueue[SENSOR_QUEUE_INDEXES[2]-1] &amp;&amp; !sensorQueue[SENSOR_QUEUE_INDEXES[3]-1] &amp;&amp; !sensorQueue[  SENSOR_QUEUE_INDEXES[4]-1])</formula>
+			<comment>3. Probability that no queue ever exceeds the maximum allowed length</comment>
+			<result outcome="success" type="interval" value="≥ 0.950056 (95% CI)" timestamp="2023-07-20 18:55:49 +0200">
+				<option key="--diagnostic" value="1"/>
+				<details>≥ 0.950056 (95% CI)</details>
+			</result>
+		</query>
+		<query>
+			<formula>Pr[&lt;=TAU] (&lt;&gt; exists(obj : id_obj) Object(obj).slot == SLOTS_AFTER_PS[0] &amp;&amp; Object(obj).inSlot == true)</formula>
+			<comment>Confirm that an object can exit a processing station and that the deadlock that happens in concrete simulation doesnt't affect the verification of the others queries</comment>
+			<result outcome="success" type="quantity" value="0.874266 ± 0.0447769 (95% CI)" timestamp="2023-07-20 19:00:03 +0200">
+				<option key="--diagnostic" value="1"/>
+				<details>0.874266 ± 0.0447769 (95% CI)</details>
+				<plot title="Probability Density Distribution" xaxis="run duration in time" yaxis="probability density">
+					<series title="density" type="b(3.333333)" color="0x0000ff" encoding="csv">250.0,0.001339285714285714
+253.33333333333334,0.0
+256.6666666666667,0.0
+260.0,0.021428571428571425
+263.3333333333333,0.0
+266.6666666666667,0.0
+270.0,0.10982142857142856
+273.3333333333333,0.0
+276.6666666666667,0.0
+280.0,0.08839285714285713
+283.3333333333333,0.0
+286.6666666666667,0.0
+290.0,0.03883928571428571
+293.3333333333333,0.0
+296.6666666666667,0.0
+300.0,0.0040178571428571425
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">275.83756345177665,0.0
+275.83756345177665,0.10982142857142856
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=3.3333, bucket count=16
+Runs: 224 in total, 197 (87.946%) displayed, 27 (12.054%) remaining
+Span of displayed sample: [250, 300]
+Mean estimate of displayed sample: 275.84 ± 1.2769 (95% CI)</comment>
+				</plot>
+				<plot title="Probability Density Confidence Intervals" xaxis="run duration in time" yaxis="probability density">
+					<series title="upper limit" type="b(3.333333)" color="0xa0a0ff" encoding="csv">250.0,0.024621064254776556
+253.33333333333334,0.01633335216210563
+256.6666666666667,0.01633335216210563
+260.0,0.11340530061814212
+263.3333333333333,0.01633335216210563
+266.6666666666667,0.01633335216210563
+270.0,0.4328326679893392
+273.3333333333333,0.01633335216210563
+276.6666666666667,0.01633335216210563
+280.0,0.35902396435652245
+283.3333333333333,0.01633335216210563
+286.6666666666667,0.01633335216210563
+290.0,0.18061409800951905
+293.3333333333333,0.01633335216210563
+296.6666666666667,0.01633335216210563
+300.0,0.03863857130260414
+					</series>
+					<series title="lower limit" type="b(3.333333)" color="0x0000ff" encoding="csv">250.0,1.1301954131167891E-4
+253.33333333333334,0.0
+256.6666666666667,0.0
+260.0,0.04137631797077936
+263.3333333333333,0.0
+266.6666666666667,0.0
+270.0,0.30290678231528284
+273.3333333333333,0.0
+276.6666666666667,0.0
+280.0,0.23578984457089727
+283.3333333333333,0.0
+286.6666666666667,0.0
+290.0,0.08844720586257268
+293.3333333333333,0.0
+296.6666666666667,0.0
+300.0,0.0027704910118226027
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">275.83756345177665,0.0
+275.83756345177665,0.12984980039680177
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=3.3333, bucket count=16
+Runs: 224 in total, 197 (87.946%) displayed, 27 (12.054%) remaining
+Span of displayed sample: [250, 300]
+Mean estimate of displayed sample: 275.84 ± 1.2769 (95% CI)</comment>
+				</plot>
+				<plot title="Probability Distribution" xaxis="run duration in time" yaxis="probability">
+					<series title="probability" type="b(3.333333)" color="0x0000ff" encoding="csv">250.0,0.004464285714285714
+253.33333333333334,0.0
+256.6666666666667,0.0
+260.0,0.07142857142857142
+263.3333333333333,0.0
+266.6666666666667,0.0
+270.0,0.36607142857142855
+273.3333333333333,0.0
+276.6666666666667,0.0
+280.0,0.29464285714285715
+283.3333333333333,0.0
+286.6666666666667,0.0
+290.0,0.12946428571428573
+293.3333333333333,0.0
+296.6666666666667,0.0
+300.0,0.013392857142857142
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">275.83756345177665,0.0
+275.83756345177665,0.36607142857142855
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=3.3333, bucket count=16
+Runs: 224 in total, 197 (87.946%) displayed, 27 (12.054%) remaining
+Span of displayed sample: [250, 300]
+Mean estimate of displayed sample: 275.84 ± 1.2769 (95% CI)</comment>
+				</plot>
+				<plot title="Probability Confidence Intervals" xaxis="run duration in time" yaxis="probability">
+					<series title="upper limit" type="b(3.333333)" color="0xa0a0ff" encoding="csv">250.0,0.024621064254776556
+253.33333333333334,0.01633335216210563
+256.6666666666667,0.01633335216210563
+260.0,0.11340530061814212
+263.3333333333333,0.01633335216210563
+266.6666666666667,0.01633335216210563
+270.0,0.4328326679893392
+273.3333333333333,0.01633335216210563
+276.6666666666667,0.01633335216210563
+280.0,0.35902396435652245
+283.3333333333333,0.01633335216210563
+286.6666666666667,0.01633335216210563
+290.0,0.18061409800951905
+293.3333333333333,0.01633335216210563
+296.6666666666667,0.01633335216210563
+300.0,0.03863857130260414
+					</series>
+					<series title="lower limit" type="b(3.333333)" color="0x0000ff" encoding="csv">250.0,1.1301954131167891E-4
+253.33333333333334,0.0
+256.6666666666667,0.0
+260.0,0.04137631797077936
+263.3333333333333,0.0
+266.6666666666667,0.0
+270.0,0.30290678231528284
+273.3333333333333,0.0
+276.6666666666667,0.0
+280.0,0.23578984457089727
+283.3333333333333,0.0
+286.6666666666667,0.0
+290.0,0.08844720586257268
+293.3333333333333,0.0
+296.6666666666667,0.0
+300.0,0.0027704910118226027
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">275.83756345177665,0.0
+275.83756345177665,0.4328326679893392
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=3.3333, bucket count=16
+Runs: 224 in total, 197 (87.946%) displayed, 27 (12.054%) remaining
+Span of displayed sample: [250, 300]
+Mean estimate of displayed sample: 275.84 ± 1.2769 (95% CI)</comment>
+				</plot>
+				<plot title="Cumulative Probability Distribution" xaxis="run duration in time" yaxis="probability">
+					<series title="cumulative" type="l" color="0x000000" encoding="csv">250.0,0.0
+253.33333333333334,0.004464285714285714
+256.6666666666667,0.004464285714285714
+260.0,0.004464285714285714
+263.3333333333333,0.07589285714285714
+266.6666666666667,0.07589285714285714
+270.0,0.07589285714285714
+273.3333333333333,0.4419642857142857
+276.6666666666667,0.4419642857142857
+280.0,0.4419642857142857
+283.3333333333333,0.7366071428571429
+286.6666666666667,0.7366071428571429
+290.0,0.7366071428571429
+293.3333333333333,0.8660714285714286
+296.6666666666667,0.8660714285714286
+300.0,0.8660714285714286
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">275.83756345177665,0.0
+275.83756345177665,0.8794642857142857
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=3.3333, bucket count=16
+Runs: 224 in total, 197 (87.946%) displayed, 27 (12.054%) remaining
+Span of displayed sample: [250, 300]
+Mean estimate of displayed sample: 275.84 ± 1.2769 (95% CI)</comment>
+				</plot>
+				<plot title="Cumulative Probability Confidence Intervals" xaxis="run duration in time" yaxis="probability">
+					<series title="upper limit" type="k" color="0x0000dd" encoding="csv">250.0,0.01633335216210563
+253.33333333333334,0.024621064254776556
+256.6666666666667,0.024621064254776556
+260.0,0.024621064254776556
+263.3333333333333,0.11873223848219314
+266.6666666666667,0.11873223848219314
+270.0,0.11873223848219314
+273.3333333333333,0.5096336378808405
+276.6666666666667,0.5096336378808405
+280.0,0.5096336378808405
+283.3333333333333,0.7930405754227423
+286.6666666666667,0.7930405754227423
+290.0,0.7930405754227423
+293.3333333333333,0.9077812813461911
+296.6666666666667,0.9077812813461911
+300.0,0.9077812813461911
+					</series>
+					<series title="lower limit" type="k" color="0xdd0000" encoding="csv">250.0,0.0
+253.33333333333334,1.1301954131167891E-4
+256.6666666666667,1.1301954131167891E-4
+260.0,1.1301954131167891E-4
+263.3333333333333,0.04483015059099474
+266.6666666666667,0.04483015059099474
+270.0,0.04483015059099474
+273.3333333333333,0.37585146148818943
+276.6666666666667,0.37585146148818943
+280.0,0.37585146148818943
+283.3333333333333,0.6737944078056916
+286.6666666666667,0.6737944078056916
+290.0,0.6737944078056916
+293.3333333333333,0.814359285538381
+296.6666666666667,0.814359285538381
+300.0,0.814359285538381
+					</series>
+					<series title="cumulative" type="l" color="0x000000" encoding="csv">250.0,0.0
+253.33333333333334,0.004464285714285714
+256.6666666666667,0.004464285714285714
+260.0,0.004464285714285714
+263.3333333333333,0.07589285714285714
+266.6666666666667,0.07589285714285714
+270.0,0.07589285714285714
+273.3333333333333,0.4419642857142857
+276.6666666666667,0.4419642857142857
+280.0,0.4419642857142857
+283.3333333333333,0.7366071428571429
+286.6666666666667,0.7366071428571429
+290.0,0.7366071428571429
+293.3333333333333,0.8660714285714286
+296.6666666666667,0.8660714285714286
+300.0,0.8660714285714286
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">275.83756345177665,0.0
+275.83756345177665,0.8794642857142857
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=3.3333, bucket count=16
+Runs: 224 in total, 197 (87.946%) displayed, 27 (12.054%) remaining
+Span of displayed sample: [250, 300]
+Mean estimate of displayed sample: 275.84 ± 1.2769 (95% CI)</comment>
+				</plot>
+				<plot title="Frequency Histogram" xaxis="run duration in time" yaxis="count">
+					<series title="count" type="b(3.333333)" color="0x0000ff" encoding="csv">250.0,1.0
+253.33333333333334,0.0
+256.6666666666667,0.0
+260.0,16.0
+263.3333333333333,0.0
+266.6666666666667,0.0
+270.0,82.0
+273.3333333333333,0.0
+276.6666666666667,0.0
+280.0,66.0
+283.3333333333333,0.0
+286.6666666666667,0.0
+290.0,29.0
+293.3333333333333,0.0
+296.6666666666667,0.0
+300.0,3.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">275.83756345177665,0.0
+275.83756345177665,82.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=3.3333, bucket count=16
+Runs: 224 in total, 197 (87.946%) displayed, 27 (12.054%) remaining
+Span of displayed sample: [250, 300]
+Mean estimate of displayed sample: 275.84 ± 1.2769 (95% CI)</comment>
+				</plot>
+			</result>
+		</query>
+		<query>
+			<formula>Pr[&lt;=TAU] (&lt;&gt; exists(obj : id_obj) Object(obj).slot == 104 &amp;&amp; Object(obj).inSlot == true)</formula>
+			<comment>Probability that at least one object arrive at the end of the conveyor belt</comment>
+			<result outcome="success" type="quantity" value="0.0553542 ± 0.0388717 (95% CI)" timestamp="2023-07-20 18:57:15 +0200">
+				<option key="--diagnostic" value="1"/>
+				<details>0.0553542 ± 0.0388717 (95% CI)</details>
+				<plot title="Probability Density Distribution" xaxis="run duration in time" yaxis="probability density">
+					<series title="density" type="b(66.666667)" color="0x0000ff" encoding="csv">2210.0,2.2222222222222223E-4
+2276.6666666666665,1.1111111111111112E-4
+2343.3333333333335,2.2222222222222223E-4
+2410.0,1.1111111111111112E-4
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">2325.0,0.0
+2325.0,2.222222222222222E-4
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=66.667, bucket count=4
+Runs: 135 in total, 6 (4.4444%) displayed, 129 (95.556%) remaining
+Span of displayed sample: [2210, 2410]
+Mean estimate of displayed sample: 2325 ± 79.02 (95% CI)</comment>
+				</plot>
+				<plot title="Probability Density Confidence Intervals" xaxis="run duration in time" yaxis="probability density">
+					<series title="upper limit" type="b(66.666667)" color="0xa0a0ff" encoding="csv">2210.0,0.05249056893008735
+2276.6666666666665,0.04057935911608689
+2343.3333333333335,0.05249056893008735
+2410.0,0.04057935911608689
+					</series>
+					<series title="lower limit" type="b(66.666667)" color="0x0000ff" encoding="csv">2210.0,0.0017992054137938257
+2276.6666666666665,1.8752173400344644E-4
+2343.3333333333335,0.0017992054137938257
+2410.0,1.8752173400344644E-4
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">2325.0,0.0
+2325.0,7.873585339513102E-4
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=66.667, bucket count=4
+Runs: 135 in total, 6 (4.4444%) displayed, 129 (95.556%) remaining
+Span of displayed sample: [2210, 2410]
+Mean estimate of displayed sample: 2325 ± 79.02 (95% CI)</comment>
+				</plot>
+				<plot title="Probability Distribution" xaxis="run duration in time" yaxis="probability">
+					<series title="probability" type="b(66.666667)" color="0x0000ff" encoding="csv">2210.0,0.014814814814814815
+2276.6666666666665,0.007407407407407408
+2343.3333333333335,0.014814814814814815
+2410.0,0.007407407407407408
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">2325.0,0.0
+2325.0,0.014814814814814815
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=66.667, bucket count=4
+Runs: 135 in total, 6 (4.4444%) displayed, 129 (95.556%) remaining
+Span of displayed sample: [2210, 2410]
+Mean estimate of displayed sample: 2325 ± 79.02 (95% CI)</comment>
+				</plot>
+				<plot title="Probability Confidence Intervals" xaxis="run duration in time" yaxis="probability">
+					<series title="upper limit" type="b(66.666667)" color="0xa0a0ff" encoding="csv">2210.0,0.05249056893008735
+2276.6666666666665,0.04057935911608689
+2343.3333333333335,0.05249056893008735
+2410.0,0.04057935911608689
+					</series>
+					<series title="lower limit" type="b(66.666667)" color="0x0000ff" encoding="csv">2210.0,0.0017992054137938257
+2276.6666666666665,1.8752173400344644E-4
+2343.3333333333335,0.0017992054137938257
+2410.0,1.8752173400344644E-4
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">2325.0,0.0
+2325.0,0.05249056893008735
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=66.667, bucket count=4
+Runs: 135 in total, 6 (4.4444%) displayed, 129 (95.556%) remaining
+Span of displayed sample: [2210, 2410]
+Mean estimate of displayed sample: 2325 ± 79.02 (95% CI)</comment>
+				</plot>
+				<plot title="Cumulative Probability Distribution" xaxis="run duration in time" yaxis="probability">
+					<series title="cumulative" type="l" color="0x000000" encoding="csv">2210.0,0.0
+2276.6666666666665,0.014814814814814815
+2343.3333333333335,0.022222222222222223
+2410.0,0.037037037037037035
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">2325.0,0.0
+2325.0,0.0444444444444444
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=66.667, bucket count=4
+Runs: 135 in total, 6 (4.4444%) displayed, 129 (95.556%) remaining
+Span of displayed sample: [2210, 2410]
+Mean estimate of displayed sample: 2325 ± 79.02 (95% CI)</comment>
+				</plot>
+				<plot title="Cumulative Probability Confidence Intervals" xaxis="run duration in time" yaxis="probability">
+					<series title="upper limit" type="k" color="0x0000dd" encoding="csv">2210.0,0.026955081583182862
+2276.6666666666665,0.05249056893008735
+2343.3333333333335,0.06356840181433282
+2410.0,0.084314577764631
+					</series>
+					<series title="lower limit" type="k" color="0xdd0000" encoding="csv">2210.0,0.0
+2276.6666666666665,0.0017992054137938257
+2343.3333333333335,0.004606412895994998
+2410.0,0.012133331747436636
+					</series>
+					<series title="cumulative" type="l" color="0x000000" encoding="csv">2210.0,0.0
+2276.6666666666665,0.014814814814814815
+2343.3333333333335,0.022222222222222223
+2410.0,0.037037037037037035
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">2325.0,0.0
+2325.0,0.0444444444444444
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=66.667, bucket count=4
+Runs: 135 in total, 6 (4.4444%) displayed, 129 (95.556%) remaining
+Span of displayed sample: [2210, 2410]
+Mean estimate of displayed sample: 2325 ± 79.02 (95% CI)</comment>
+				</plot>
+				<plot title="Frequency Histogram" xaxis="run duration in time" yaxis="count">
+					<series title="count" type="b(66.666667)" color="0x0000ff" encoding="csv">2210.0,2.0
+2276.6666666666665,1.0
+2343.3333333333335,2.0
+2410.0,1.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">2325.0,0.0
+2325.0,2.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=66.667, bucket count=4
+Runs: 135 in total, 6 (4.4444%) displayed, 129 (95.556%) remaining
+Span of displayed sample: [2210, 2410]
+Mean estimate of displayed sample: 2325 ± 79.02 (95% CI)</comment>
+				</plot>
+			</result>
+		</query>
+		<query>
+			<formula>E[&lt;=TAU; 1000] (max : (sum(slot : id_slot) (sensorQueue[slot] == -1 ? 0 : sensorQueue[slot])))</formula>
+			<comment>Expected value of the maximum number of object in queue</comment>
+			<result outcome="success" type="quantity" value="≈ 3" timestamp="2023-07-20 18:56:25 +0200">
+				<option key="--diagnostic" value="1"/>
+				<details>≈ 3</details>
+				<plot title="Probability Density Distribution" xaxis="max: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="probability density">
+					<series title="density" type="b(1.000000)" color="0x0000ff" encoding="csv">3.0,1.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">3.0,0.0
+3.0,1.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [3, 3]
+Mean estimate of displayed sample: ≈ 3</comment>
+				</plot>
+				<plot title="Probability Distribution" xaxis="max: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="probability">
+					<series title="probability" type="b(1.000000)" color="0x0000ff" encoding="csv">3.0,1.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">3.0,0.0
+3.0,1.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [3, 3]
+Mean estimate of displayed sample: ≈ 3</comment>
+				</plot>
+				<plot title="Cumulative Probability Distribution" xaxis="max: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="probability">
+					<series title="cumulative" type="l" color="0x000000" encoding="csv">3.0,0.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">3.0,0.0
+3.0,1.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [3, 3]
+Mean estimate of displayed sample: ≈ 3</comment>
+				</plot>
+				<plot title="Cumulative Probability Confidence Intervals" xaxis="max: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="probability">
+					<series title="upper limit" type="k" color="0x0000dd" encoding="csv">3.0,0.003682083896865672
+					</series>
+					<series title="lower limit" type="k" color="0xdd0000" encoding="csv">3.0,0.0
+					</series>
+					<series title="cumulative" type="l" color="0x000000" encoding="csv">3.0,0.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">3.0,0.0
+3.0,1.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [3, 3]
+Mean estimate of displayed sample: ≈ 3</comment>
+				</plot>
+				<plot title="Frequency Histogram" xaxis="max: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="count">
+					<series title="count" type="b(1.000000)" color="0x0000ff" encoding="csv">3.0,1000.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">3.0,0.0
+3.0,1000.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [3, 3]
+Mean estimate of displayed sample: ≈ 3</comment>
+				</plot>
+			</result>
+		</query>
+		<query>
+			<formula>E[&lt;=TAU; 1000] (min : (sum(slot : id_slot) (sensorQueue[slot] == -1 ? 0 : sensorQueue[slot])))</formula>
+			<comment>Expected value of the minimum number of object in queue</comment>
+			<result outcome="success" type="quantity" value="≈ 0" timestamp="2023-07-20 18:56:55 +0200">
+				<option key="--diagnostic" value="1"/>
+				<details>≈ 0</details>
+				<plot title="Probability Density Distribution" xaxis="min: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="probability density">
+					<series title="density" type="b(1.000000)" color="0x0000ff" encoding="csv">0.0,1.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">0.0,0.0
+0.0,1.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [0, 0]
+Mean estimate of displayed sample: ≈ 0</comment>
+				</plot>
+				<plot title="Probability Distribution" xaxis="min: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="probability">
+					<series title="probability" type="b(1.000000)" color="0x0000ff" encoding="csv">0.0,1.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">0.0,0.0
+0.0,1.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [0, 0]
+Mean estimate of displayed sample: ≈ 0</comment>
+				</plot>
+				<plot title="Cumulative Probability Distribution" xaxis="min: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="probability">
+					<series title="cumulative" type="l" color="0x000000" encoding="csv">0.0,0.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">0.0,0.0
+0.0,1.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [0, 0]
+Mean estimate of displayed sample: ≈ 0</comment>
+				</plot>
+				<plot title="Cumulative Probability Confidence Intervals" xaxis="min: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="probability">
+					<series title="upper limit" type="k" color="0x0000dd" encoding="csv">0.0,0.003682083896865672
+					</series>
+					<series title="lower limit" type="k" color="0xdd0000" encoding="csv">0.0,0.0
+					</series>
+					<series title="cumulative" type="l" color="0x000000" encoding="csv">0.0,0.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">0.0,0.0
+0.0,1.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [0, 0]
+Mean estimate of displayed sample: ≈ 0</comment>
+				</plot>
+				<plot title="Frequency Histogram" xaxis="min: sum (slot:(const (label id_slot:(range (int) &quot;0&quot; &quot;nSlots - 1&quot;)))) sensorQueue[slot] == -1 ? 0 : sensorQueue[slot]" yaxis="count">
+					<series title="count" type="b(1.000000)" color="0x0000ff" encoding="csv">0.0,1000.0
+					</series>
+					<series title="average" type="pl" color="0x00dd00" encoding="csv">0.0,0.0
+0.0,1000.0
+					</series>
+					<comment>Parameters: α=0.05, ε=0.05, bucket width=1, bucket count=1
+Runs: 1000 in total, 1000 (100%) displayed, 0 (0%) remaining
+Span of displayed sample: [0, 0]
+Mean estimate of displayed sample: ≈ 0</comment>
+				</plot>
+			</result>
+		</query>
+	</queries>
+</nta>
